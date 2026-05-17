@@ -84,6 +84,8 @@ start:
 
     mov si, loaded_msg
     call print
+    mov dl, [boot_drive]
+    mov byte [0x04ff], dl
     jmp 0x0000:KERNEL_LOAD
 
 read_sectors:
@@ -158,13 +160,12 @@ fatal:
     hlt
     jmp .hang
 
-kernel_name db 'KERNEL  BIN'
+kernel_name db 'DOSKRNL BIN'
 loading_msg db 'TS-OS boot: reading FAT12...', 13, 10, 0
-loaded_msg db 'Jumping to TypeScript kernel.', 13, 10, 0
-missing_msg db 'KERNEL.BIN not found.', 13, 10, 0
+loaded_msg db 'Jumping to TypeScript DOS kernel.', 13, 10, 0
+missing_msg db 'DOSKRNL.BIN not found.', 13, 10, 0
 disk_msg db 'Disk read error.', 13, 10, 0
 boot_drive db 0
 
 times 510 - ($ - $$) db 0
 dw 0xaa55
-
