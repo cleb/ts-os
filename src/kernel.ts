@@ -231,16 +231,10 @@ function halt(): void {
   }
 }
 
-// Launching a user program is a primitive (x86LaunchProgram) rather than a
-// TypeScript wrapper: as soon as DS changes to the user segment, every
-// kernel local-variable access reads the wrong memory. The cli/segments/
-// SS:SP/sti/retf sequence has to be atomic, so we let the compiler emit
-// it as a single primitive.
-
 // === Asm IRET trampolines ===
 //
-// These are the only inline asm in the kernel. They cannot be written in
-// TypeScript because:
+// These plus the launch-program block at the bottom of main are the only
+// inline asm in the kernel. They cannot be written in TypeScript because:
 //   1. The CPU enters them with the caller's segments + flags pushed, and
 //      they must end with IRET (which TypeScript has no equivalent for).
 //   2. They have to switch DS to the kernel's data segment (0) before
@@ -367,4 +361,23 @@ setupPsp(PROG_SEG);
 
 putString(x86Cstr("Launching HELLO.COM.\r\n"));
 
-x86LaunchProgram(PROG_SEG, PROG_OFF);
+// Atomic context switch into the user program. This is the one place in
+// the kernel where switching DS makes every subsequent TS local-variable
+// access (DS-relative) read the wrong memory, so the whole cli/segments/
+// SS:SP/sti/retf sequence has to happen inside a single inline-asm block
+// that touches no kernel data between `mov ds` and `retf`. PROG_SEG/PROG_OFF
+// are hardcoded here and must stay in sync with the consts above (0x2000 /
+// 0x0100); we never reach this code if those change without an update.
+x86Asm(`
+  cli
+  mov ax, 0x2000
+  mov ds, ax
+  mov es, ax
+  mov ss, ax
+  mov sp, 0xfffe
+  push ax
+  mov ax, 0x0100
+  push ax
+  sti
+  retf
+`);
