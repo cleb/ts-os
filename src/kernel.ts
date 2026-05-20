@@ -82,7 +82,19 @@ function putString(addr: number): void {
 
 function readSector(lba: number, destSeg: number, destOff: number): void {
   const drive = x86PeekByte(DRIVE_BYTE_ADDR);
-  x86ReadDisk(drive, lba, destSeg, destOff);
+  // LBA -> CHS for a 1.44 MB FAT12 floppy (geometry: 2 heads, 18 sectors per
+  // track, 80 cylinders). All real-mode INT 13h disk reads are expressed in
+  // this 1-based sector / 0-based head / 0-based cylinder triple.
+  const sec = (lba % 18) + 1;
+  const headCyl = (lba / 18) | 0;
+  const head = headCyl % 2;
+  const cyl = (headCyl / 2) | 0;
+  // INT 13h AH=02h, AL=sector-count, CH=cyl[7:0], CL=sec[5:0] | (cyl[9:8]<<6),
+  // DH=head, DL=drive, ES:BX -> destination buffer.
+  const ax = 0x0200 | 1;
+  const cx = ((cyl & 0xff) << 8) | (sec & 0x3f);
+  const dx = ((head & 0xff) << 8) | (drive & 0xff);
+  x86Interrupt(0x13, ax, destOff, cx, dx, 0, 0, destSeg);
 }
 
 function readSectors(startLba: number, count: number, destSeg: number, destOff: number): void {
@@ -195,8 +207,35 @@ function dispatchInt20(): void {
 function terminateProgram(code: number): void {
   x86PokeByte(EXIT_CODE_ADDR, code & 0xff);
   putString(x86Cstr("\r\n[TS-DOS] program terminated.\r\n"));
-  x86Halt();
+  halt();
 }
+
+// === Low-level kernel choreography ===
+//
+// These wrap the narrow x86 primitives so the boot/main code stays readable.
+
+function installInterruptStub(intNo: number, stubOffset: number): void {
+  // Real-mode IVT: 4 bytes per vector at 0000:(intNo*4) -> offset, then segment.
+  // Our stubs live in the kernel segment (0), so the segment word is always 0.
+  const vecOff = intNo * 4;
+  x86PokeWord(vecOff, stubOffset);
+  x86PokeWord(vecOff + 2, 0);
+}
+
+function halt(): void {
+  // cli + a wait-for-interrupt loop. Because interrupts are disabled, only an
+  // NMI can wake the CPU and we'll immediately re-enter hlt anyway.
+  x86Cli();
+  while (1 != 0) {
+    x86Hlt();
+  }
+}
+
+// Launching a user program is a primitive (x86LaunchProgram) rather than a
+// TypeScript wrapper: as soon as DS changes to the user segment, every
+// kernel local-variable access reads the wrong memory. The cli/segments/
+// SS:SP/sti/retf sequence has to be atomic, so we let the compiler emit
+// it as a single primitive.
 
 // === Asm IRET trampolines ===
 //
@@ -284,9 +323,11 @@ iret
 // Make sure DS/ES point at the kernel (segment 0).
 x86SetSegments(0);
 
-// Install our INT 20h and INT 21h vectors.
-x86InstallInterruptStub(0x20, "__int20_stub");
-x86InstallInterruptStub(0x21, "__int21_stub");
+// Install our INT 20h and INT 21h vectors. x86LabelOffset turns a compile-time
+// asm label into a runtime number, so the IVT install itself is plain
+// TypeScript memory pokes.
+installInterruptStub(0x20, x86LabelOffset("__int20_stub"));
+installInterruptStub(0x21, x86LabelOffset("__int21_stub"));
 
 putString(x86Cstr("TS-DOS TypeScript kernel: INT 20h/21h ready.\r\n"));
 
@@ -311,7 +352,7 @@ readSectors(ROOT_LBA, ROOT_BUF_SECTORS, 0, ROOT_BUF);
 const entry = findFile(ROOT_BUF, HELLO_NAME_ADDR);
 if (entry == 0) {
   putString(x86Cstr("HELLO.COM not found on disk.\r\n"));
-  x86Halt();
+  halt();
 }
 
 // Read file size (4 bytes little-endian at offset 28) and first cluster (16-bit
@@ -326,5 +367,4 @@ setupPsp(PROG_SEG);
 
 putString(x86Cstr("Launching HELLO.COM.\r\n"));
 
-// Switch DS=ES=SS=PROG_SEG, set SP, and far-jump to PROG_SEG:PROG_OFF.
 x86LaunchProgram(PROG_SEG, PROG_OFF);
