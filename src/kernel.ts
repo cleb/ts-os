@@ -445,6 +445,84 @@ function dispatchInt21(): void {
     continueSearch();
     return;
   }
+  if (ah == 0x30) {
+    // Get DOS Version: AL=major, AH=minor, BH=OEM (0xFF=MS-DOS), BL:CX=serial.
+    // Report 5.00 — high enough for most 1990s software to enable its
+    // modern code paths but low enough that programs don't expect long
+    // file names or other 7.x-era features.
+    x86PokeWord(USER_AX, 0x0005);
+    x86PokeWord(USER_BX, 0xff00);
+    x86PokeWord(USER_CX, 0x0000);
+    return;
+  }
+  if (ah == 0x25) {
+    // Set Interrupt Vector: AL=int#, DS:DX=handler. Write into the IVT.
+    const intNo = ax & 0xff;
+    x86PokeWord(intNo * 4, x86PeekWord(USER_DX));
+    x86PokeWord(intNo * 4 + 2, x86PeekWord(USER_DS));
+    return;
+  }
+  if (ah == 0x35) {
+    // Get Interrupt Vector: AL=int#. Return ES:BX = handler.
+    const intNo = ax & 0xff;
+    x86PokeWord(USER_BX, x86PeekWord(intNo * 4));
+    x86PokeWord(USER_ES, x86PeekWord(intNo * 4 + 2));
+    return;
+  }
+  if (ah == 0x2c) {
+    // Get System Time: CH=hour, CL=minute, DH=second, DL=hundredths.
+    // We don't track a real-time clock; report all zeros so callers
+    // that just want a tick see a stable "midnight" value.
+    x86PokeWord(USER_CX, 0x0000);
+    x86PokeWord(USER_DX, 0x0000);
+    return;
+  }
+  if (ah == 0x2a) {
+    // Get System Date: CX=year, DH=month, DL=day, AL=day-of-week.
+    // Report 1993-01-01 (a Friday) — close to VLAK's release year so
+    // anything that gates content on year-of-build sees a plausible
+    // value.
+    x86PokeWord(USER_CX, 1993);
+    x86PokeWord(USER_DX, 0x0101);
+    x86PokeWord(USER_AX, (ax & 0xff00) | 5);
+    return;
+  }
+  if (ah == 0x4a) {
+    // Resize Memory Block: BX = new paragraph count. We give every
+    // process the entire 64K segment, so just succeed.
+    return;
+  }
+  if (ah == 0x48) {
+    // Allocate Memory Block: BX = paragraphs requested. We don't run
+    // an allocator; report failure (CF=1, AX=error 8 = insufficient
+    // memory, BX=max available paragraphs = 0) by returning AX=8.
+    x86PokeWord(USER_AX, 0x0008);
+    x86PokeWord(USER_BX, 0x0000);
+    return;
+  }
+  if (ah == 0x06) {
+    // Direct Console I/O. DL=0xFF means "read", anything else means
+    // "write character DL". The read path is non-blocking and returns
+    // ZF=1 if no key is available; we don't expose flags, so we use
+    // the simpler convention of always polling and returning AL=0
+    // when no key is ready (this matches what callers checking
+    // `cmp al, 0` expect).
+    const dx = x86PeekWord(USER_DX);
+    if ((dx & 0xff) == 0xff) {
+      // Read: BIOS INT 16h AH=01h "check keystroke" sets ZF if no key
+      // pending; AH=00h reads the key.
+      const status = x86Interrupt(0x16, 0x0100, 0, 0, 0, 0, 0);
+      if (status == 0) {
+        x86PokeWord(USER_AX, ax & 0xff00);
+        return;
+      }
+      const ch = x86Interrupt(0x16, 0x0000, 0, 0, 0, 0, 0) & 0xff;
+      x86PokeWord(USER_AX, (ax & 0xff00) | ch);
+      return;
+    }
+    bdaPutChar(dx & 0xff);
+    return;
+  }
   if (ah == 0x02) {
     const dx = x86PeekWord(USER_DX);
     bdaPutChar(dx & 0xff);
@@ -474,8 +552,16 @@ function dispatchInt21(): void {
     x86PokeWord(USER_AX, (ax & 0xff00) | (ch & 0xff));
     return;
   }
-  // Unsupported — print a complaint and terminate.
-  putString(x86Cstr("\r\nUnsupported INT 21h service.\r\n"));
+  // Unsupported — log AH on the console + serial so we know what to
+  // add, then terminate. AH is shown as two hex digits.
+  putString(x86Cstr("\r\nUnsupported INT 21h AH=0x"));
+  const ahHi = (ah >>> 4) & 0xf;
+  const ahLo = ah & 0xf;
+  if (ahHi < 10) bdaPutChar(ahHi + 0x30);
+  else bdaPutChar(ahHi - 10 + 0x41);
+  if (ahLo < 10) bdaPutChar(ahLo + 0x30);
+  else bdaPutChar(ahLo - 10 + 0x41);
+  putString(x86Cstr("\r\n"));
   terminateProgram(0xff);
 }
 

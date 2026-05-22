@@ -12,14 +12,16 @@ import * as tsos from "ts-os";
 // Right-aligned 16-bit decimal print. Iterative so we don't recurse
 // through the backend's globally-allocated parameter slots (the x86
 // raw target does not yet stack-allocate locals/params, so recursion
-// would overwrite `n` and `width` from the inner call).
+// would overwrite `n` and `width` from the inner call). Caps digits at
+// 5 — 16-bit unsigned numbers never exceed 65535, and multiplying past
+// 10000 in our signed 16-bit divisor would wrap to a negative value
+// that breaks the divisor>0 print loop.
 function printDec(n: number, width: number): void {
   let divisor = 1;
   let digits = 1;
-  while (1 != 0) {
+  while (digits < 5) {
     const next = divisor * 10;
     if (next > n) break;
-    if (next == 0) break;
     divisor = next;
     digits = digits + 1;
   }
