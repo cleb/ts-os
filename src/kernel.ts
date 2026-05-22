@@ -21,10 +21,15 @@
 // 0x0400 - 0x04FE : BIOS data area
 // 0x04FF          : boot drive byte (stashed by boot.asm before the far-jump)
 // 0x0500 - 0x051F : ISR scratch (saved user registers including SS:SP)
-// 0x0700 - 0x07FF : kernel scratch (exit code, parent-state save area, name)
+// 0x0700 - 0x07FF : kernel scratch (exit code, parent-state save, DTA ptr,
+//                   search cursor)
 // 0x0800 - 0x0FFF : kernel stack (grows down from 0x1000)
 // 0x1000 - 0x7FFF : kernel image (TS-compiled binary) + Perry data slots
-// 0x8000 - 0x9FFF : FAT12 root-directory buffer
+// 0x8000 - 0x9BFF : current-directory cache (14 sectors = 7168 bytes)
+// 0xA000 - 0xB1FF : FAT cache (9 sectors = 4608 bytes)
+// 0xB200 - 0xB3FF : directory-scan sector buffer
+// 0xB400 - 0xB5FF : file-I/O sector buffer
+// 0xB600 - 0xB6FF : file-handle table + CWD path + assorted scratch
 // 0x2000:0x0000   : "current" user program PSP (the shell, COMMAND.COM)
 // 0x2000:0x0100   : "current" user program code (.COM)
 // 0x3000:0x0000   : child program PSP (spawned by COMMAND.COM via INT 21h AH=4Bh)
@@ -69,10 +74,49 @@ const PARENT_DS = 0x0724;
 const PARENT_ES = 0x0726;
 
 // FAT12 layout for a 1.44MB floppy with our boot sector.
+const FAT_LBA = 1;
+const FAT2_LBA = 10;
+const FAT_SECTORS = 9;
 const ROOT_LBA = 19;
 const ROOT_BUF_SECTORS = 14;
-const ROOT_BUF = 0x8000;
 const DATA_LBA_MINUS_TWO = 31;
+
+// Cached copies + I/O buffers (kernel segment 0).
+const DIR_CACHE_BUF = 0x8000;
+const FAT_BUF = 0xa000;
+const DIR_SCAN_BUF = 0xb200;
+const FILE_IO_BUF = 0xb400;
+
+// File-handle table (4 handles × 16 bytes). User-visible handle numbers
+// start at 3 (handles 0–2 are reserved for stdin/stdout/stderr).
+const HANDLE_TABLE = 0xb600;
+const HANDLE_COUNT = 4;
+const HANDLE_SIZE = 16;
+const FIRST_HANDLE = 3;
+
+// CWD path string (ASCIIZ, max 64 chars, no leading backslash, no drive
+// letter — matches the AH=47h return value contract).
+const CURRENT_PATH = 0xb650;
+const CURRENT_PATH_MAX = 64;
+// Cluster number of the directory we treat as cwd. 0 == root dir.
+const CURRENT_DIR_CLUSTER = 0xb6a0;
+
+// FAT caching state.
+const FAT_LOADED = 0xb6a2;
+const FAT_DIRTY = 0xb6a3;
+
+// findEntryByName / findFreeEntry communicate their match position to
+// the caller via these slots (so callers can read and rewrite the
+// 32-byte dir entry still sitting in DIR_SCAN_BUF).
+const FOUND_LBA = 0xb6a4;
+const FOUND_INDEX = 0xb6a6;
+// walkPath result.
+const RESULT_DIR_CLUSTER = 0xb6a8;
+
+// Component scratch used by path parsing (uppercased ASCIIZ, up to 15
+// chars plus NUL — long enough for an 8.3 name and "..").
+const COMP_BUF = 0xb6b0;
+const COMP_BUF_MAX = 16;
 
 // Program load segment / offset (classic MS-DOS COM layout: PSP at :0000,
 // program code at :0100, single 64K segment).
@@ -152,6 +196,806 @@ function readSectors(startLba: number, count: number, destSeg: number, destOff: 
     readSector(startLba + i, destSeg, destOff + i * 512);
     i = i + 1;
   }
+}
+
+function writeSector(lba: number, srcSeg: number, srcOff: number): void {
+  const drive = x86PeekByte(DRIVE_BYTE_ADDR);
+  const sec = (lba % 18) + 1;
+  const headCyl = (lba / 18) | 0;
+  const head = headCyl % 2;
+  const cyl = (headCyl / 2) | 0;
+  // INT 13h AH=03h: write sectors. Same packing as the read path.
+  const ax = 0x0300 | 1;
+  const cx = ((cyl & 0xff) << 8) | (sec & 0x3f);
+  const dx = ((head & 0xff) << 8) | (drive & 0xff);
+  x86Interrupt(0x13, ax, srcOff, cx, dx, 0, 0, srcSeg);
+}
+
+// === FAT cache ===
+//
+// Lazy-loaded on first use; flushed back to BOTH FAT copies on
+// saveFat() so a power-loss leaves the disk consistent enough for
+// real DOS to read.
+
+function loadFat(): void {
+  if (x86PeekByte(FAT_LOADED) != 0) return;
+  readSectors(FAT_LBA, FAT_SECTORS, 0, FAT_BUF);
+  x86PokeByte(FAT_LOADED, 1);
+  x86PokeByte(FAT_DIRTY, 0);
+}
+
+function saveFat(): void {
+  if (x86PeekByte(FAT_DIRTY) == 0) return;
+  let i = 0;
+  while (i < FAT_SECTORS) {
+    writeSector(FAT_LBA + i, 0, FAT_BUF + i * 512);
+    writeSector(FAT2_LBA + i, 0, FAT_BUF + i * 512);
+    i = i + 1;
+  }
+  x86PokeByte(FAT_DIRTY, 0);
+}
+
+function readFat(cluster: number): number {
+  // FAT12 packs 12-bit entries: byte offset = cluster + cluster/2.
+  const off = cluster + (cluster >>> 1);
+  const lo = x86PeekByte(FAT_BUF + off);
+  const hi = x86PeekByte(FAT_BUF + off + 1);
+  const raw = lo | (hi << 8);
+  if ((cluster & 1) != 0) return (raw >>> 4) & 0xfff;
+  return raw & 0xfff;
+}
+
+function writeFatEntry(cluster: number, value: number): void {
+  const off = cluster + (cluster >>> 1);
+  const lo = x86PeekByte(FAT_BUF + off);
+  const hi = x86PeekByte(FAT_BUF + off + 1);
+  if ((cluster & 1) != 0) {
+    x86PokeByte(FAT_BUF + off, (lo & 0x0f) | ((value << 4) & 0xf0));
+    x86PokeByte(FAT_BUF + off + 1, (value >>> 4) & 0xff);
+  } else {
+    x86PokeByte(FAT_BUF + off, value & 0xff);
+    x86PokeByte(FAT_BUF + off + 1, (hi & 0xf0) | ((value >>> 8) & 0x0f));
+  }
+  x86PokeByte(FAT_DIRTY, 1);
+}
+
+function allocCluster(): number {
+  loadFat();
+  let c = 2;
+  while (c < 2849) {
+    if (readFat(c) == 0) {
+      writeFatEntry(c, 0xfff);
+      return c;
+    }
+    c = c + 1;
+  }
+  return 0;
+}
+
+// === Directory iteration ===
+//
+// dirSectorLba(dirCluster, sectorIndex) returns the absolute LBA of
+// the Nth 512-byte sector of the named directory. Root (cluster 0)
+// occupies the fixed root-dir area; everything else is a cluster
+// chain in the data area, with one sector per cluster on this floppy.
+
+function dirSectorLba(dirCluster: number, sectorIndex: number): number {
+  if (dirCluster == 0) {
+    if (sectorIndex >= ROOT_BUF_SECTORS) return 0;
+    return ROOT_LBA + sectorIndex;
+  }
+  loadFat();
+  let cluster = dirCluster;
+  let i = 0;
+  while (i < sectorIndex) {
+    cluster = readFat(cluster);
+    if (cluster >= 0xff8) return 0;
+    i = i + 1;
+  }
+  return DATA_LBA_MINUS_TWO + cluster;
+}
+
+function dirSectorCount(dirCluster: number): number {
+  if (dirCluster == 0) return ROOT_BUF_SECTORS;
+  loadFat();
+  let cluster = dirCluster;
+  let n = 1;
+  while (n < 32) {
+    const next = readFat(cluster);
+    if (next >= 0xff8) break;
+    cluster = next;
+    n = n + 1;
+  }
+  return n;
+}
+
+// Walks the directory looking for an entry whose 11-byte name matches
+// NAME_ADDR. On success returns 1, writes the containing sector's LBA
+// to FOUND_LBA and the in-sector entry index (0..15) to FOUND_INDEX,
+// and leaves that sector in DIR_SCAN_BUF so callers can either read
+// more fields or rewrite the entry. On miss returns 0.
+function findEntryByName(dirCluster: number, nameAddr: number): number {
+  const count = dirSectorCount(dirCluster);
+  let s = 0;
+  while (s < count) {
+    const lba = dirSectorLba(dirCluster, s);
+    if (lba == 0) return 0;
+    readSector(lba, 0, DIR_SCAN_BUF);
+    let i = 0;
+    while (i < 16) {
+      const entry = DIR_SCAN_BUF + i * 32;
+      const first = x86PeekByte(entry);
+      if (first == 0) return 0;
+      if (first != 0xe5) {
+        if (nameMatches(entry, nameAddr) != 0) {
+          x86PokeWord(FOUND_LBA, lba);
+          x86PokeWord(FOUND_INDEX, i);
+          return 1;
+        }
+      }
+      i = i + 1;
+    }
+    s = s + 1;
+  }
+  return 0;
+}
+
+// Like findEntryByName, but returns the first unused slot (first byte
+// 0x00 = never used or 0xE5 = deleted). The containing sector is left
+// in DIR_SCAN_BUF so the caller can fill the entry and write back.
+function findFreeEntry(dirCluster: number): number {
+  const count = dirSectorCount(dirCluster);
+  let s = 0;
+  while (s < count) {
+    const lba = dirSectorLba(dirCluster, s);
+    if (lba == 0) return 0;
+    readSector(lba, 0, DIR_SCAN_BUF);
+    let i = 0;
+    while (i < 16) {
+      const entry = DIR_SCAN_BUF + i * 32;
+      const first = x86PeekByte(entry);
+      if (first == 0) {
+        x86PokeWord(FOUND_LBA, lba);
+        x86PokeWord(FOUND_INDEX, i);
+        return 1;
+      }
+      if (first == 0xe5) {
+        x86PokeWord(FOUND_LBA, lba);
+        x86PokeWord(FOUND_INDEX, i);
+        return 1;
+      }
+      i = i + 1;
+    }
+    s = s + 1;
+  }
+  return 0;
+}
+
+// Caches the current directory's sectors in DIR_CACHE_BUF so the
+// AH=4Eh/AH=4Fh enumeration loop can use the existing entry-index
+// cursor regardless of whether the cwd is root or a subdirectory.
+function loadCurrentDir(): void {
+  const dir = x86PeekWord(CURRENT_DIR_CLUSTER);
+  if (dir == 0) {
+    readSectors(ROOT_LBA, ROOT_BUF_SECTORS, 0, DIR_CACHE_BUF);
+    return;
+  }
+  loadFat();
+  let cluster = dir;
+  let i = 0;
+  while (i < ROOT_BUF_SECTORS) {
+    if (cluster >= 0xff8) break;
+    readSector(DATA_LBA_MINUS_TWO + cluster, 0, DIR_CACHE_BUF + i * 512);
+    cluster = readFat(cluster);
+    i = i + 1;
+  }
+  // Sentinel so continueSearch stops at end of chain.
+  if (i < ROOT_BUF_SECTORS) {
+    x86PokeByte(DIR_CACHE_BUF + i * 512, 0);
+  }
+}
+
+// === Path parsing ===
+
+function isPathSep(ch: number): number {
+  if (ch == 0x5c) return 1;
+  if (ch == 0x2f) return 1;
+  return 0;
+}
+
+// Read one path component from `srcSeg:srcOff` starting at `pos` into
+// COMP_BUF as uppercased ASCIIZ. Returns the new offset, positioned
+// at the trailing separator (or the terminating NUL).
+function readPathComponent(srcSeg: number, srcOff: number, pos: number): number {
+  let i = 0;
+  while (i + 1 < COMP_BUF_MAX) {
+    const ch = x86PeekFar(srcSeg, srcOff + pos);
+    if (ch == 0) break;
+    if (isPathSep(ch) != 0) break;
+    x86PokeByte(COMP_BUF + i, upperByte(ch));
+    pos = pos + 1;
+    i = i + 1;
+  }
+  x86PokeByte(COMP_BUF + i, 0);
+  return pos;
+}
+
+function compIsDot(): number {
+  if (x86PeekByte(COMP_BUF) != 0x2e) return 0;
+  if (x86PeekByte(COMP_BUF + 1) != 0) return 0;
+  return 1;
+}
+
+function compIsDotDot(): number {
+  if (x86PeekByte(COMP_BUF) != 0x2e) return 0;
+  if (x86PeekByte(COMP_BUF + 1) != 0x2e) return 0;
+  if (x86PeekByte(COMP_BUF + 2) != 0) return 0;
+  return 1;
+}
+
+// Convert COMP_BUF (uppercased "STEM[.EXT]") into the 11-byte FAT 8.3
+// form at NAME_ADDR. Returns 1 on success, 0 if the component is
+// empty or has a stem/ext that's too long.
+function compToFatName(): number {
+  fillNameSpaces();
+  let s = 0;
+  let stem = 0;
+  let ext = 0;
+  let sawDot = 0;
+  while (1 != 0) {
+    const ch = x86PeekByte(COMP_BUF + s);
+    if (ch == 0) break;
+    if (ch == 0x2e) {
+      if (sawDot != 0) return 0;
+      sawDot = 1;
+      s = s + 1;
+      continue;
+    }
+    if (sawDot == 0) {
+      if (stem >= 8) return 0;
+      x86PokeByte(NAME_ADDR + stem, ch);
+      stem = stem + 1;
+    } else {
+      if (ext >= 3) return 0;
+      x86PokeByte(NAME_ADDR + 8 + ext, ch);
+      ext = ext + 1;
+    }
+    s = s + 1;
+  }
+  if (stem == 0) return 0;
+  return 1;
+}
+
+// === CWD path string maintenance ===
+//
+// CURRENT_PATH holds the AH=47h-style relative path (no drive letter,
+// no leading backslash). Mutated by pathAppend/pathPop as the user
+// chdirs into and out of subdirectories.
+
+function pathLen(): number {
+  let i = 0;
+  while (i < CURRENT_PATH_MAX) {
+    if (x86PeekByte(CURRENT_PATH + i) == 0) return i;
+    i = i + 1;
+  }
+  return CURRENT_PATH_MAX;
+}
+
+function pathReset(): void {
+  x86PokeByte(CURRENT_PATH, 0);
+}
+
+function pathPopComponent(): void {
+  let len = pathLen();
+  if (len == 0) return;
+  // Trim trailing chars until (and including) the previous backslash.
+  while (len > 0) {
+    len = len - 1;
+    const ch = x86PeekByte(CURRENT_PATH + len);
+    if (ch == 0x5c) {
+      x86PokeByte(CURRENT_PATH + len, 0);
+      return;
+    }
+  }
+  pathReset();
+}
+
+// Append a component already sitting in COMP_BUF (uppercased ASCIIZ)
+// to CURRENT_PATH, inserting a separator if needed. Truncates rather
+// than overflowing the 64-byte buffer.
+function pathAppendComp(): void {
+  let len = pathLen();
+  if (len > 0) {
+    if (len + 1 >= CURRENT_PATH_MAX) return;
+    x86PokeByte(CURRENT_PATH + len, 0x5c);
+    len = len + 1;
+  }
+  let i = 0;
+  while (1 != 0) {
+    const ch = x86PeekByte(COMP_BUF + i);
+    if (ch == 0) break;
+    if (len + 1 >= CURRENT_PATH_MAX) break;
+    x86PokeByte(CURRENT_PATH + len, ch);
+    len = len + 1;
+    i = i + 1;
+  }
+  x86PokeByte(CURRENT_PATH + len, 0);
+}
+
+// === Path resolution ===
+//
+// walkPath traverses `srcSeg:srcOff` (ASCIIZ DOS path) one component
+// at a time, navigating into subdirectories via the FAT chain.
+//
+//   updatePath != 0 : the caller is implementing chdir; we mirror the
+//                     navigation into CURRENT_PATH (so getCwd reflects
+//                     the new dir on success).
+//   lastIsLeaf != 0 : stop one component short and leave the trailing
+//                     8.3 name in NAME_ADDR. Used by open/create/
+//                     mkdir, which need to act on the leaf name in
+//                     its parent directory.
+//
+// Returns 0 on success (writes the resulting directory cluster to
+// RESULT_DIR_CLUSTER), 2 on "not found", 3 on bad path syntax.
+
+function walkPath(srcSeg: number, srcOff: number, lastIsLeaf: number, updatePath: number): number {
+  let dir = x86PeekWord(CURRENT_DIR_CLUSTER);
+  let pos = 0;
+  // Snapshot CURRENT_PATH so we can roll back on failure when updatePath.
+  if (updatePath != 0) {
+    if (isPathSep(x86PeekFar(srcSeg, srcOff)) != 0) {
+      // Caller asked for an absolute path: reset.
+      pathReset();
+    }
+  }
+  if (isPathSep(x86PeekFar(srcSeg, srcOff)) != 0) {
+    dir = 0;
+    pos = 1;
+  }
+  while (1 != 0) {
+    while (isPathSep(x86PeekFar(srcSeg, srcOff + pos)) != 0) pos = pos + 1;
+    if (x86PeekFar(srcSeg, srcOff + pos) == 0) {
+      if (lastIsLeaf != 0) return 3;
+      x86PokeWord(RESULT_DIR_CLUSTER, dir);
+      return 0;
+    }
+    pos = readPathComponent(srcSeg, srcOff, pos);
+    let p2 = pos;
+    while (isPathSep(x86PeekFar(srcSeg, srcOff + p2)) != 0) p2 = p2 + 1;
+    let isLast = 0;
+    if (x86PeekFar(srcSeg, srcOff + p2) == 0) isLast = 1;
+    if (lastIsLeaf != 0) {
+      if (isLast != 0) {
+        if (compToFatName() == 0) return 3;
+        x86PokeWord(RESULT_DIR_CLUSTER, dir);
+        return 0;
+      }
+    }
+    if (compIsDot() != 0) {
+      pos = p2;
+      continue;
+    }
+    if (compIsDotDot() != 0) {
+      if (dir != 0) {
+        fillNameSpaces();
+        x86PokeByte(NAME_ADDR + 0, 0x2e);
+        x86PokeByte(NAME_ADDR + 1, 0x2e);
+        if (findEntryByName(dir, NAME_ADDR) == 0) return 2;
+        const idx = x86PeekWord(FOUND_INDEX);
+        const entry = DIR_SCAN_BUF + idx * 32;
+        dir = x86PeekWord(entry + 26);
+      }
+      if (updatePath != 0) pathPopComponent();
+      pos = p2;
+      continue;
+    }
+    if (compToFatName() == 0) return 3;
+    if (findEntryByName(dir, NAME_ADDR) == 0) return 2;
+    const idx = x86PeekWord(FOUND_INDEX);
+    const entry = DIR_SCAN_BUF + idx * 32;
+    const attr = x86PeekByte(entry + 11);
+    if ((attr & 0x10) == 0) return 2;
+    dir = x86PeekWord(entry + 26);
+    if (updatePath != 0) pathAppendComp();
+    pos = p2;
+  }
+  return 3;
+}
+
+// === MKDIR / CHDIR / GETCWD ===
+
+function dispatchMakeDir(): void {
+  const ds = x86PeekWord(USER_DS);
+  const dx = x86PeekWord(USER_DX);
+  loadFat();
+  const err = walkPath(ds, dx, 1, 0);
+  if (err != 0) {
+    x86PokeWord(USER_AX, 3);
+    return;
+  }
+  const parent = x86PeekWord(RESULT_DIR_CLUSTER);
+  if (findEntryByName(parent, NAME_ADDR) != 0) {
+    x86PokeWord(USER_AX, 5);
+    return;
+  }
+  if (findFreeEntry(parent) == 0) {
+    x86PokeWord(USER_AX, 3);
+    return;
+  }
+  const newCluster = allocCluster();
+  if (newCluster == 0) {
+    x86PokeWord(USER_AX, 3);
+    return;
+  }
+  // Write the parent's new entry: copy NAME_ADDR into slot, set
+  // attribute=0x10 (directory), zero metadata, store first_cluster.
+  const dirLba = x86PeekWord(FOUND_LBA);
+  const dirIdx = x86PeekWord(FOUND_INDEX);
+  const entry = DIR_SCAN_BUF + dirIdx * 32;
+  let i = 0;
+  while (i < 11) {
+    x86PokeByte(entry + i, x86PeekByte(NAME_ADDR + i));
+    i = i + 1;
+  }
+  i = 11;
+  while (i < 32) {
+    x86PokeByte(entry + i, 0);
+    i = i + 1;
+  }
+  x86PokeByte(entry + 11, 0x10);
+  x86PokeByte(entry + 26, newCluster & 0xff);
+  x86PokeByte(entry + 27, (newCluster >>> 8) & 0xff);
+  writeSector(dirLba, 0, DIR_SCAN_BUF);
+  // Initialize the new dir cluster with "." and ".." entries.
+  i = 0;
+  while (i < 512) {
+    x86PokeByte(DIR_SCAN_BUF + i, 0);
+    i = i + 1;
+  }
+  // "."
+  x86PokeByte(DIR_SCAN_BUF + 0, 0x2e);
+  i = 1;
+  while (i < 11) {
+    x86PokeByte(DIR_SCAN_BUF + i, 0x20);
+    i = i + 1;
+  }
+  x86PokeByte(DIR_SCAN_BUF + 11, 0x10);
+  x86PokeByte(DIR_SCAN_BUF + 26, newCluster & 0xff);
+  x86PokeByte(DIR_SCAN_BUF + 27, (newCluster >>> 8) & 0xff);
+  // ".."
+  x86PokeByte(DIR_SCAN_BUF + 32, 0x2e);
+  x86PokeByte(DIR_SCAN_BUF + 33, 0x2e);
+  i = 2;
+  while (i < 11) {
+    x86PokeByte(DIR_SCAN_BUF + 32 + i, 0x20);
+    i = i + 1;
+  }
+  x86PokeByte(DIR_SCAN_BUF + 32 + 11, 0x10);
+  x86PokeByte(DIR_SCAN_BUF + 32 + 26, parent & 0xff);
+  x86PokeByte(DIR_SCAN_BUF + 32 + 27, (parent >>> 8) & 0xff);
+  writeSector(DATA_LBA_MINUS_TWO + newCluster, 0, DIR_SCAN_BUF);
+  saveFat();
+  x86PokeWord(USER_AX, 0);
+}
+
+function dispatchChDir(): void {
+  const ds = x86PeekWord(USER_DS);
+  const dx = x86PeekWord(USER_DX);
+  // Save current state in case walkPath fails after partially
+  // mutating CURRENT_PATH (the per-component pathPopComponent /
+  // pathAppendComp).
+  let backup = 0;
+  let savedDir = x86PeekWord(CURRENT_DIR_CLUSTER);
+  // We mirror CURRENT_PATH into the dir-scan buffer (transiently —
+  // restored before any actual scan happens) so we can revert on
+  // error. The path is at most 64 bytes; DIR_SCAN_BUF is 512.
+  while (backup < CURRENT_PATH_MAX) {
+    x86PokeByte(DIR_SCAN_BUF + backup, x86PeekByte(CURRENT_PATH + backup));
+    backup = backup + 1;
+  }
+  loadFat();
+  const err = walkPath(ds, dx, 0, 1);
+  if (err != 0) {
+    // Restore path.
+    let j = 0;
+    while (j < CURRENT_PATH_MAX) {
+      x86PokeByte(CURRENT_PATH + j, x86PeekByte(DIR_SCAN_BUF + j));
+      j = j + 1;
+    }
+    x86PokeWord(USER_AX, 3);
+    return;
+  }
+  x86PokeWord(CURRENT_DIR_CLUSTER, x86PeekWord(RESULT_DIR_CLUSTER));
+  if (savedDir == savedDir) { /* keep param to silence unused */ }
+  x86PokeWord(USER_AX, 0);
+}
+
+function dispatchGetCwd(): void {
+  const ds = x86PeekWord(USER_DS);
+  const si = x86PeekWord(USER_SI);
+  let i = 0;
+  while (i < CURRENT_PATH_MAX) {
+    const ch = x86PeekByte(CURRENT_PATH + i);
+    x86PokeFar(ds, si + i, ch);
+    if (ch == 0) return;
+    i = i + 1;
+  }
+  x86PokeFar(ds, si + CURRENT_PATH_MAX, 0);
+}
+
+// === File handles + open/close/read/write ===
+//
+// Handle layout (16 bytes, base = HANDLE_TABLE + (h - FIRST_HANDLE) * 16):
+//   +0  byte  in_use (1 if allocated)
+//   +1  byte  dir_entry_idx within dir_sector
+//   +2  word  first_cluster
+//   +4  word  current_cluster (cluster containing pos's sector)
+//   +6  word  pos (bytes; 16-bit — files on this floppy stay <64 KB)
+//   +8  word  size (bytes)
+//   +10 word  dir_sector_lba (where the dir entry lives, for size flush)
+//   +12 word  write_mode (1 if file is open for writing)
+//   +14 word  unused
+
+function handleAddr(h: number): number {
+  return HANDLE_TABLE + (h - FIRST_HANDLE) * HANDLE_SIZE;
+}
+
+function handleInUse(h: number): number {
+  if (h < FIRST_HANDLE) return 0;
+  if (h >= FIRST_HANDLE + HANDLE_COUNT) return 0;
+  return x86PeekByte(handleAddr(h));
+}
+
+function allocHandle(): number {
+  let h = FIRST_HANDLE;
+  while (h < FIRST_HANDLE + HANDLE_COUNT) {
+    if (x86PeekByte(handleAddr(h)) == 0) {
+      x86PokeByte(handleAddr(h), 1);
+      return h;
+    }
+    h = h + 1;
+  }
+  return 0;
+}
+
+function freeHandle(h: number): void {
+  if (handleInUse(h) == 0) return;
+  x86PokeByte(handleAddr(h), 0);
+}
+
+function dispatchOpen(): void {
+  // AH=3Dh AL=mode (0=read, 1=write, 2=rw — we ignore the distinction).
+  // On error we return AX=0; on success AX = handle (>= FIRST_HANDLE).
+  // The shell's `if (handle == 0)` check is enough to distinguish them
+  // because allocHandle never hands out 0/1/2 (those are reserved for
+  // stdin/stdout/stderr).
+  const ds = x86PeekWord(USER_DS);
+  const dx = x86PeekWord(USER_DX);
+  loadFat();
+  const err = walkPath(ds, dx, 1, 0);
+  if (err != 0) {
+    x86PokeWord(USER_AX, 0);
+    return;
+  }
+  const parent = x86PeekWord(RESULT_DIR_CLUSTER);
+  if (findEntryByName(parent, NAME_ADDR) == 0) {
+    x86PokeWord(USER_AX, 0);
+    return;
+  }
+  const dirLba = x86PeekWord(FOUND_LBA);
+  const idx = x86PeekWord(FOUND_INDEX);
+  const entry = DIR_SCAN_BUF + idx * 32;
+  const attr = x86PeekByte(entry + 11);
+  if ((attr & 0x10) != 0) {
+    x86PokeWord(USER_AX, 0);
+    return;
+  }
+  const first = x86PeekWord(entry + 26);
+  const sz = x86PeekWord(entry + 28);
+  const h = allocHandle();
+  if (h == 0) {
+    x86PokeWord(USER_AX, 0);
+    return;
+  }
+  const hb = handleAddr(h);
+  x86PokeByte(hb + 1, idx);
+  x86PokeWord(hb + 2, first);
+  x86PokeWord(hb + 4, first);
+  x86PokeWord(hb + 6, 0);
+  x86PokeWord(hb + 8, sz);
+  x86PokeWord(hb + 10, dirLba);
+  x86PokeWord(hb + 12, 0);
+  x86PokeWord(USER_AX, h);
+}
+
+function dispatchCreate(): void {
+  // AH=3Ch DS:DX=ASCIIZ name, CX=attribute. Create-or-truncate. Returns
+  // AX=0 on error, AX=handle on success — same sentinel convention as
+  // dispatchOpen so callers can use a single `if (h == 0)` check.
+  const ds = x86PeekWord(USER_DS);
+  const dx = x86PeekWord(USER_DX);
+  loadFat();
+  const err = walkPath(ds, dx, 1, 0);
+  if (err != 0) {
+    x86PokeWord(USER_AX, 0);
+    return;
+  }
+  const parent = x86PeekWord(RESULT_DIR_CLUSTER);
+  let dirLba = 0;
+  let idx = 0;
+  if (findEntryByName(parent, NAME_ADDR) != 0) {
+    // Truncate: free existing cluster chain.
+    dirLba = x86PeekWord(FOUND_LBA);
+    idx = x86PeekWord(FOUND_INDEX);
+    const entry = DIR_SCAN_BUF + idx * 32;
+    let c = x86PeekWord(entry + 26);
+    while (c >= 2) {
+      if (c >= 0xff8) break;
+      const next = readFat(c);
+      writeFatEntry(c, 0);
+      c = next;
+    }
+    // Re-read sector (writeFatEntry hasn't touched DIR_SCAN_BUF, but
+    // be defensive in case findFreeEntry pattern is reused).
+    readSector(dirLba, 0, DIR_SCAN_BUF);
+  } else {
+    if (findFreeEntry(parent) == 0) {
+      x86PokeWord(USER_AX, 0);
+      return;
+    }
+    dirLba = x86PeekWord(FOUND_LBA);
+    idx = x86PeekWord(FOUND_INDEX);
+  }
+  // Fill the entry. The first cluster stays 0 until the first write
+  // actually allocates one.
+  const entry = DIR_SCAN_BUF + idx * 32;
+  let i = 0;
+  while (i < 11) {
+    x86PokeByte(entry + i, x86PeekByte(NAME_ADDR + i));
+    i = i + 1;
+  }
+  i = 11;
+  while (i < 32) {
+    x86PokeByte(entry + i, 0);
+    i = i + 1;
+  }
+  x86PokeByte(entry + 11, 0x20);
+  writeSector(dirLba, 0, DIR_SCAN_BUF);
+  saveFat();
+  const h = allocHandle();
+  if (h == 0) {
+    x86PokeWord(USER_AX, 0);
+    return;
+  }
+  const hb = handleAddr(h);
+  x86PokeByte(hb + 1, idx);
+  x86PokeWord(hb + 2, 0);
+  x86PokeWord(hb + 4, 0);
+  x86PokeWord(hb + 6, 0);
+  x86PokeWord(hb + 8, 0);
+  x86PokeWord(hb + 10, dirLba);
+  x86PokeWord(hb + 12, 1);
+  x86PokeWord(USER_AX, h);
+}
+
+function dispatchClose(): void {
+  const h = x86PeekWord(USER_BX);
+  if (handleInUse(h) == 0) {
+    x86PokeWord(USER_AX, 6);
+    return;
+  }
+  const hb = handleAddr(h);
+  if (x86PeekWord(hb + 12) != 0) {
+    // Flush size + first cluster into the dir entry.
+    const dirLba = x86PeekWord(hb + 10);
+    const idx = x86PeekByte(hb + 1);
+    const size = x86PeekWord(hb + 8);
+    const first = x86PeekWord(hb + 2);
+    readSector(dirLba, 0, DIR_SCAN_BUF);
+    const entry = DIR_SCAN_BUF + idx * 32;
+    x86PokeByte(entry + 26, first & 0xff);
+    x86PokeByte(entry + 27, (first >>> 8) & 0xff);
+    x86PokeByte(entry + 28, size & 0xff);
+    x86PokeByte(entry + 29, (size >>> 8) & 0xff);
+    x86PokeByte(entry + 30, 0);
+    x86PokeByte(entry + 31, 0);
+    writeSector(dirLba, 0, DIR_SCAN_BUF);
+    saveFat();
+  }
+  freeHandle(h);
+  x86PokeWord(USER_AX, 0);
+}
+
+function dispatchReadFile(): void {
+  const h = x86PeekWord(USER_BX);
+  if (handleInUse(h) == 0) {
+    x86PokeWord(USER_AX, 6);
+    return;
+  }
+  const hb = handleAddr(h);
+  const userDs = x86PeekWord(USER_DS);
+  const userDx = x86PeekWord(USER_DX);
+  const req = x86PeekWord(USER_CX);
+  let pos = x86PeekWord(hb + 6);
+  const size = x86PeekWord(hb + 8);
+  let cluster = x86PeekWord(hb + 4);
+  let read = 0;
+  loadFat();
+  while (read < req) {
+    if (pos >= size) break;
+    const offset = pos & 511;
+    if (offset == 0) {
+      if (cluster < 2) break;
+      if (cluster >= 0xff8) break;
+      readSector(DATA_LBA_MINUS_TWO + cluster, 0, FILE_IO_BUF);
+    }
+    const ch = x86PeekByte(FILE_IO_BUF + offset);
+    x86PokeFar(userDs, userDx + read, ch);
+    pos = pos + 1;
+    read = read + 1;
+    if ((pos & 511) == 0) cluster = readFat(cluster);
+  }
+  x86PokeWord(hb + 4, cluster);
+  x86PokeWord(hb + 6, pos);
+  x86PokeWord(USER_AX, read);
+}
+
+function dispatchWriteFile(h: number): void {
+  const hb = handleAddr(h);
+  const userDs = x86PeekWord(USER_DS);
+  const userDx = x86PeekWord(USER_DX);
+  const req = x86PeekWord(USER_CX);
+  let pos = x86PeekWord(hb + 6);
+  let size = x86PeekWord(hb + 8);
+  let cluster = x86PeekWord(hb + 4);
+  let written = 0;
+  loadFat();
+  while (written < req) {
+    const offset = pos & 511;
+    if (offset == 0) {
+      if (pos >= size) {
+        // Allocate a fresh cluster and link it on.
+        const newCluster = allocCluster();
+        if (newCluster == 0) break;
+        const firstCluster = x86PeekWord(hb + 2);
+        if (firstCluster == 0) {
+          x86PokeWord(hb + 2, newCluster);
+        } else {
+          if (cluster >= 2) {
+            if (cluster < 0xff8) writeFatEntry(cluster, newCluster);
+          }
+        }
+        cluster = newCluster;
+        // Zero buffer for the fresh sector.
+        let j = 0;
+        while (j < 512) {
+          x86PokeByte(FILE_IO_BUF + j, 0);
+          j = j + 1;
+        }
+      } else {
+        readSector(DATA_LBA_MINUS_TWO + cluster, 0, FILE_IO_BUF);
+      }
+    }
+    const ch = x86PeekFar(userDs, userDx + written);
+    x86PokeByte(FILE_IO_BUF + offset, ch);
+    pos = pos + 1;
+    written = written + 1;
+    if ((pos & 511) == 0) {
+      writeSector(DATA_LBA_MINUS_TWO + cluster, 0, FILE_IO_BUF);
+      const next = readFat(cluster);
+      if (next < 0xff8) cluster = next;
+    }
+  }
+  // Flush partial sector.
+  if ((pos & 511) != 0) {
+    writeSector(DATA_LBA_MINUS_TWO + cluster, 0, FILE_IO_BUF);
+  }
+  if (pos > size) size = pos;
+  x86PokeWord(hb + 4, cluster);
+  x86PokeWord(hb + 6, pos);
+  x86PokeWord(hb + 8, size);
+  saveFat();
+  x86PokeWord(USER_AX, written);
 }
 
 function nameMatches(entryAddr: number, nameAddr: number): number {
@@ -294,20 +1138,33 @@ function tsosReadBufferedLine(): void {
 function dispatchWriteHandle(): void {
   const handle = x86PeekWord(USER_BX);
   const count = x86PeekWord(USER_CX);
-  if (handle != 1) {
-    if (handle != 2) {
-      x86PokeWord(USER_AX, 0);
-      return;
+  if (handle == 1) {
+    const ds = x86PeekWord(USER_DS);
+    const dx = x86PeekWord(USER_DX);
+    let i = 0;
+    while (i < count) {
+      bdaPutChar(x86PeekFar(ds, dx + i));
+      i = i + 1;
     }
+    x86PokeWord(USER_AX, count);
+    return;
   }
-  const ds = x86PeekWord(USER_DS);
-  const dx = x86PeekWord(USER_DX);
-  let i = 0;
-  while (i < count) {
-    bdaPutChar(x86PeekFar(ds, dx + i));
-    i = i + 1;
+  if (handle == 2) {
+    const ds = x86PeekWord(USER_DS);
+    const dx = x86PeekWord(USER_DX);
+    let i = 0;
+    while (i < count) {
+      bdaPutChar(x86PeekFar(ds, dx + i));
+      i = i + 1;
+    }
+    x86PokeWord(USER_AX, count);
+    return;
   }
-  x86PokeWord(USER_AX, count);
+  if (handleInUse(handle) != 0) {
+    dispatchWriteFile(handle);
+    return;
+  }
+  x86PokeWord(USER_AX, 6);
 }
 
 // === DOS Set-DTA / FindFirst / FindNext (INT 21h AH=1Ah/4Eh/4Fh) ===
@@ -371,7 +1228,7 @@ function copyEntryToDta(entry: number): void {
 function continueSearch(): void {
   let i = x86PeekWord(SEARCH_CURSOR_ADDR);
   while (i < 224) {
-    const entry = ROOT_BUF + i * 32;
+    const entry = DIR_CACHE_BUF + i * 32;
     const first = x86PeekByte(entry);
     if (first == 0) break;
     if (first != 0xe5) {
@@ -395,7 +1252,7 @@ function continueSearch(): void {
 
 function dispatchFindFirst(): void {
   // Pattern at DS:DX is ignored — TS-DOS treats every call as "*.*".
-  readSectors(ROOT_LBA, ROOT_BUF_SECTORS, 0, ROOT_BUF);
+  loadCurrentDir();
   x86PokeWord(SEARCH_CURSOR_ADDR, 0);
   continueSearch();
 }
@@ -443,6 +1300,34 @@ function dispatchInt21(): void {
   }
   if (ah == 0x4f) {
     continueSearch();
+    return;
+  }
+  if (ah == 0x39) {
+    dispatchMakeDir();
+    return;
+  }
+  if (ah == 0x3b) {
+    dispatchChDir();
+    return;
+  }
+  if (ah == 0x47) {
+    dispatchGetCwd();
+    return;
+  }
+  if (ah == 0x3c) {
+    dispatchCreate();
+    return;
+  }
+  if (ah == 0x3d) {
+    dispatchOpen();
+    return;
+  }
+  if (ah == 0x3e) {
+    dispatchClose();
+    return;
+  }
+  if (ah == 0x3f) {
+    dispatchReadFile();
     return;
   }
   if (ah == 0x30) {
@@ -590,18 +1475,26 @@ function snapshotParent(): void {
 }
 
 function launchChildFromName(): void {
-  readSectors(ROOT_LBA, ROOT_BUF_SECTORS, 0, ROOT_BUF);
-  const entry = findFile(ROOT_BUF, NAME_ADDR);
+  loadCurrentDir();
+  const entry = findFile(DIR_CACHE_BUF, NAME_ADDR);
   if (entry == 0) {
     putString(x86Cstr("File not found.\r\n"));
     x86PokeWord(PARENT_SS, 0);
     return;
   }
-  const sizeLo = x86PeekWord(entry + 28);
   const firstCluster = x86PeekWord(entry + 26);
-  const numSectors = (sizeLo + 511) >>> 9;
-  const lba = DATA_LBA_MINUS_TWO + firstCluster;
-  readSectors(lba, numSectors, CHILD_SEG, PROG_OFF);
+  // Follow the cluster chain in case the COM file isn't contiguous
+  // (write+exec workflows can fragment the data area).
+  loadFat();
+  let cluster = firstCluster;
+  let s = 0;
+  while (s < 128) {
+    if (cluster < 2) break;
+    if (cluster >= 0xff8) break;
+    readSector(DATA_LBA_MINUS_TWO + cluster, CHILD_SEG, PROG_OFF + s * 512);
+    cluster = readFat(cluster);
+    s = s + 1;
+  }
   setupPsp(CHILD_SEG);
 
   // Step 4: context switch into child. Same shape as the boot launcher
@@ -802,6 +1695,19 @@ installInterruptStub(0x21, x86LabelOffset("__int21_stub"));
 // No parent process is waiting for the boot shell.
 x86PokeWord(PARENT_SS, 0);
 
+// Start at the root directory with an empty cwd string. FAT cache is
+// loaded lazily on first read/write operation.
+x86PokeWord(CURRENT_DIR_CLUSTER, 0);
+pathReset();
+x86PokeByte(FAT_LOADED, 0);
+x86PokeByte(FAT_DIRTY, 0);
+// Reset file-handle table.
+let __h = 0;
+while (__h < HANDLE_COUNT) {
+  x86PokeByte(HANDLE_TABLE + __h * HANDLE_SIZE, 0);
+  __h = __h + 1;
+}
+
 serialInit();
 putString(x86Cstr("TS-DOS TypeScript kernel: INT 20h/21h/4Bh/4Ch ready.\r\n"));
 
@@ -820,10 +1726,11 @@ x86PokeByte(NAME_ADDR + 8, 0x43);  // C
 x86PokeByte(NAME_ADDR + 9, 0x4f);  // O
 x86PokeByte(NAME_ADDR + 10, 0x4d); // M
 
-// Read the FAT12 root directory into our buffer.
-readSectors(ROOT_LBA, ROOT_BUF_SECTORS, 0, ROOT_BUF);
+// Read the FAT12 root directory into our cache so the boot path can
+// find COMMAND.COM.
+readSectors(ROOT_LBA, ROOT_BUF_SECTORS, 0, DIR_CACHE_BUF);
 
-const entry = findFile(ROOT_BUF, NAME_ADDR);
+const entry = findFile(DIR_CACHE_BUF, NAME_ADDR);
 if (entry == 0) {
   putString(x86Cstr("COMMAND.COM not found on disk.\r\n"));
   halt();
